@@ -7,6 +7,7 @@
 //
 
 import Foundation
+import os
 
 enum PowerManagerError: LocalizedError {
     case scriptFailed(status: Int32, message: String)
@@ -36,13 +37,50 @@ final class PowerManager {
             Task {
                 do {
                     try await helper.setSleepDisabled(disable)
+                    Log.power.log("disablesleep=\(disable ? 1 : 0) set via helper")
                     completion(.success(()))
                 } catch {
+                    Log.power.error("helper setSleepDisabled failed: \(error.localizedDescription, privacy: .public) — falling back to osascript")
                     self.disableSleepViaOsascript(disable, completion: completion)
                 }
             }
         } else {
+            Log.power.log("helper not usable (state not enabled) — using osascript for disablesleep=\(disable ? 1 : 0)")
             disableSleepViaOsascript(disable, completion: completion)
+        }
+    }
+
+    /// Forces immediate sleep. Needed after re-enabling sleep with the lid
+    /// closed: clearing `disablesleep` doesn't re-trigger clamshell sleep,
+    /// so without this the machine stays awake until the next lid event.
+    func sleepNow() {
+        if helper.isUsable {
+            Task {
+                do {
+                    try await helper.sleepNow()
+                    Log.power.log("sleepnow issued via helper")
+                } catch {
+                    Log.power.error("helper sleepNow failed: \(error.localizedDescription, privacy: .public) — trying pmset directly")
+                    self.sleepNowDirect()
+                }
+            }
+        } else {
+            sleepNowDirect()
+        }
+    }
+
+    private func sleepNowDirect() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
+            process.arguments = ["sleepnow"]
+            do {
+                try process.run()
+                process.waitUntilExit()
+                Log.power.log("pmset sleepnow (direct) exit=\(process.terminationStatus)")
+            } catch {
+                Log.power.error("couldn't launch pmset sleepnow: \(error.localizedDescription, privacy: .public)")
+            }
         }
     }
 

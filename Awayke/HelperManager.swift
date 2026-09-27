@@ -4,6 +4,7 @@
 //
 
 import Foundation
+import os
 import ServiceManagement
 import AppKit
 
@@ -28,6 +29,21 @@ enum HelperError: LocalizedError {
         case .remoteError(let underlying):
             return underlying.localizedDescription
         }
+    }
+}
+
+/// Ensures a continuation is resumed exactly once when several completion
+/// paths race (reply, XPC error handler, timeout).
+private final class ResumeGuard {
+    private let lock = NSLock()
+    private var used = false
+
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if used { return false }
+        used = true
+        return true
     }
 }
 
@@ -80,38 +96,74 @@ final class HelperManager {
     }
 
     func setSleepDisabled(_ disable: Bool) async throws {
-        let proxy = try ensureProxy()
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            proxy.setSleepDisabled(disable) { remoteError in
-                if let remoteError {
-                    continuation.resume(throwing: HelperError.remoteError(remoteError))
-                } else {
-                    continuation.resume()
-                }
-            }
-        }
+        try await performCall { proxy, reply in proxy.setSleepDisabled(disable, reply: reply) }
     }
 
-    private func ensureProxy() throws -> AwaykeHelperProtocol {
+    func sleepNow() async throws {
+        try await performCall { proxy, reply in proxy.sleepNow(reply: reply) }
+    }
+
+    /// Runs one XPC call with a reply timeout. Without the timeout a call
+    /// can hang forever: if the daemon registration went stale (the app
+    /// bundle was replaced in place), launchd retries spawning the helper
+    /// indefinitely and the message stays queued, so neither the reply nor
+    /// the error handler ever fires. A connection-level failure also
+    /// triggers re-registration against the current bundle.
+    private func performCall(_ invoke: @escaping (AwaykeHelperProtocol, @escaping (NSError?) -> Void) -> Void) async throws {
         guard isUsable else { throw HelperError.helperUnavailable }
 
         let conn = connection ?? makeConnection()
         connection = conn
 
-        var proxyError: Error?
-        let proxy = conn.remoteObjectProxyWithErrorHandler { error in
-            proxyError = error
-        } as? AwaykeHelperProtocol
+        let resumed = ResumeGuard()
+        do {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                func finish(_ result: Result<Void, Error>) {
+                    guard resumed.claim() else { return }
+                    continuation.resume(with: result)
+                }
 
-        if let proxyError {
-            connection?.invalidate()
-            connection = nil
-            throw HelperError.connectionFailed(proxyError.localizedDescription)
+                guard let proxy = conn.remoteObjectProxyWithErrorHandler({ error in
+                    finish(.failure(HelperError.connectionFailed(error.localizedDescription)))
+                }) as? AwaykeHelperProtocol else {
+                    finish(.failure(HelperError.connectionFailed("Couldn't cast remote proxy to AwaykeHelperProtocol")))
+                    return
+                }
+
+                DispatchQueue.global().asyncAfter(deadline: .now() + 5) {
+                    finish(.failure(HelperError.connectionFailed("helper didn't reply within 5s")))
+                }
+
+                invoke(proxy) { remoteError in
+                    if let remoteError {
+                        finish(.failure(HelperError.remoteError(remoteError)))
+                    } else {
+                        finish(.success(()))
+                    }
+                }
+            }
+        } catch {
+            if case HelperError.connectionFailed = error {
+                repairRegistration()
+            }
+            throw error
         }
-        guard let proxy else {
-            throw HelperError.connectionFailed("Couldn't cast remote proxy to AwaykeHelperProtocol")
+    }
+
+    /// A stale registration survives app-bundle replacement and leaves
+    /// launchd unable to spawn the helper ("Could not find and/or execute
+    /// program specified by service"). Unregister + register points launchd
+    /// back at the current bundle.
+    private func repairRegistration() {
+        Log.power.error("helper connection failed — re-registering daemon")
+        connection?.invalidate()
+        connection = nil
+        do {
+            try service.unregister()
+        } catch {
+            Log.power.error("unregister during repair failed: \(error.localizedDescription, privacy: .public)")
         }
-        return proxy
+        register()
     }
 
     private func makeConnection() -> NSXPCConnection {

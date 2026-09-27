@@ -32,9 +32,17 @@ final class HelperTool: NSObject, NSXPCListenerDelegate, AwaykeHelperProtocol {
     }
 
     func setSleepDisabled(_ disable: Bool, reply: @escaping (NSError?) -> Void) {
+        runPmset(["-a", "disablesleep", disable ? "1" : "0"], reply: reply)
+    }
+
+    func sleepNow(reply: @escaping (NSError?) -> Void) {
+        runPmset(["sleepnow"], reply: reply)
+    }
+
+    private func runPmset(_ arguments: [String], reply: @escaping (NSError?) -> Void) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
-        process.arguments = ["-a", "disablesleep", disable ? "1" : "0"]
+        process.arguments = arguments
 
         let errPipe = Pipe()
         process.standardError = errPipe

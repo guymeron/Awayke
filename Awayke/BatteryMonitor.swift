@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import IOKit
 import IOKit.ps
 
 final class BatteryMonitor {
@@ -59,5 +60,24 @@ final class BatteryMonitor {
             return (percent, onBattery)
         }
         return nil
+    }
+
+    /// Whether the laptop lid is closed. Returns nil if the state can't
+    /// be read (e.g. desktop Macs).
+    static func isLidClosed() -> Bool? {
+        let service = IOServiceGetMatchingService(
+            kIOMainPortDefault,
+            IOServiceMatching("IOPMrootDomain")
+        )
+        guard service != 0 else { return nil }
+        defer { IOObjectRelease(service) }
+
+        guard let state = IORegistryEntryCreateCFProperty(
+            service,
+            "AppleClamshellState" as CFString,
+            kCFAllocatorDefault,
+            0
+        )?.takeRetainedValue() as? Bool else { return nil }
+        return state
     }
 }

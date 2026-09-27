@@ -4,6 +4,7 @@
 //
 
 import AppKit
+import os
 import ServiceManagement
 import UserNotifications
 
@@ -31,6 +32,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        if CommandLine.arguments.contains("--repair-helper") {
+            Log.power.log("manual helper repair: unregister before register")
+            helper.unregister()
+        }
         helper.register()
 
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -51,8 +56,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // without running its quit cleanup leaves SleepDisabled = 1.
         // Silently reset it via the helper. Skipped if the helper isn't
         // approved (no password prompt for cleanup the user didn't ask for).
+        // Helper only — no osascript fallback here, so a broken helper
+        // can't pop a password prompt the user didn't ask for. A failed
+        // call triggers the helper's own registration repair.
         if helper.isUsable {
-            powerManager.disableSleep(false) { _ in }
+            Task { [helper] in
+                do {
+                    try await helper.setSleepDisabled(false)
+                    Log.power.log("launch cleanup: disablesleep reset via helper")
+                } catch {
+                    Log.power.error("launch cleanup failed: \(error.localizedDescription, privacy: .public)")
+                }
+            }
         }
 
         batteryMonitor.onChange = { [weak self] in
@@ -68,18 +83,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Only acts while discharging, so a plugged-in Mac sitting below the
     /// limit isn't affected.
     private func enforceBatteryLimit() {
-        guard isActive, batteryLimit > 0,
-              let status = BatteryMonitor.currentStatus(),
-              status.onBattery, status.percent <= batteryLimit else { return }
+        guard batteryLimit > 0 else { return }
+        guard let status = BatteryMonitor.currentStatus() else {
+            Log.battery.error("power event received but battery status unavailable")
+            return
+        }
+        Log.battery.log("power event: \(status.percent)% onBattery=\(status.onBattery) active=\(self.isActive) limit=\(self.batteryLimit)%")
 
+        guard isActive, status.onBattery, status.percent <= batteryLimit else { return }
+
+        Log.battery.log("battery limit reached — turning Awayke off")
         let percent = status.percent
         powerManager.disableSleep(false) { [weak self] result in
             DispatchQueue.main.async {
-                guard let self, case .success = result else { return }
-                self.isActive = false
-                self.postBatteryLimitNotification(percent: percent)
+                guard let self else { return }
+                switch result {
+                case .success:
+                    self.isActive = false
+                    self.postBatteryLimitNotification(percent: percent)
+                    Log.battery.log("auto-off done")
+                    self.sleepIfLidClosed()
+                case .failure(let error):
+                    Log.battery.error("auto-off FAILED, sleep still disabled: \(error.localizedDescription, privacy: .public)")
+                }
             }
         }
+    }
+
+    /// Forces sleep when the lid is closed while on battery. Clearing
+    /// disablesleep doesn't re-trigger clamshell sleep, so after Awayke
+    /// turns off with the lid already closed the machine would stay
+    /// awake until the next lid event. Skipped on AC power so closed-lid
+    /// clamshell setups with external displays keep working.
+    private func sleepIfLidClosed() {
+        let lidClosed = BatteryMonitor.isLidClosed()
+        let onBattery = BatteryMonitor.currentStatus()?.onBattery ?? false
+        Log.power.log("sleepIfLidClosed: lidClosed=\(String(describing: lidClosed), privacy: .public) onBattery=\(onBattery)")
+        guard lidClosed == true, onBattery else { return }
+        powerManager.sleepNow()
     }
 
     private func postBatteryLimitNotification(percent: Int) {
@@ -142,7 +183,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 switch result {
                 case .success:
                     self.isActive = target
-                    if target { self.enforceBatteryLimit() }
+                    if target {
+                        self.enforceBatteryLimit()
+                    } else {
+                        self.sleepIfLidClosed()
+                    }
                 case .failure(let error): self.presentError(error)
                 }
             }
@@ -206,6 +251,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func menuSetBatteryLimit(_ sender: NSMenuItem) {
         batteryLimit = sender.tag
+        Log.battery.log("battery limit set to \(sender.tag)%")
         if batteryLimit > 0 {
             UNUserNotificationCenter.current()
                 .requestAuthorization(options: [.alert, .sound]) { _, _ in }

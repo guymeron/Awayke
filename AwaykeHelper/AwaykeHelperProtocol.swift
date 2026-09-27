@@ -6,6 +6,7 @@ import Foundation
 
 @objc public protocol AwaykeHelperProtocol {
     func setSleepDisabled(_ disable: Bool, reply: @escaping (NSError?) -> Void)
+    func sleepNow(reply: @escaping (NSError?) -> Void)
 }
 
 public enum AwaykeHelperConstants {
