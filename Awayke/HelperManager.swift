@@ -144,7 +144,7 @@ final class HelperManager {
             }
         } catch {
             if case HelperError.connectionFailed = error {
-                repairRegistration()
+                await repairRegistration()
             }
             throw error
         }
@@ -154,16 +154,55 @@ final class HelperManager {
     /// launchd unable to spawn the helper ("Could not find and/or execute
     /// program specified by service"). Unregister + register points launchd
     /// back at the current bundle.
-    private func repairRegistration() {
+    ///
+    /// The two steps must be sequenced: `unregister()` completes before
+    /// launchd has actually dropped the job, so an immediate `register()`
+    /// can be processed first and then wiped by the pending removal,
+    /// leaving no daemon at all. Wait for the status to leave `.enabled`
+    /// before registering again.
+    private func repairRegistration() async {
+        guard claimRepair() else { return }
+        defer { releaseRepair() }
+
         Log.power.error("helper connection failed — re-registering daemon")
         connection?.invalidate()
         connection = nil
+
         do {
-            try service.unregister()
+            try await service.unregister()
         } catch {
             Log.power.error("unregister during repair failed: \(error.localizedDescription, privacy: .public)")
         }
+
+        var waited = 0
+        while service.status == .enabled && waited < 30 {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            waited += 1
+        }
+        if service.status == .enabled {
+            Log.power.error("repair: daemon still enabled after unregister — skipping register to avoid a race")
+            return
+        }
+
         register()
+        Log.power.log("repair: re-registered, state=\(String(describing: self.state), privacy: .public)")
+    }
+
+    private let repairLock = NSLock()
+    private var repairInProgress = false
+
+    private func claimRepair() -> Bool {
+        repairLock.lock()
+        defer { repairLock.unlock() }
+        if repairInProgress { return false }
+        repairInProgress = true
+        return true
+    }
+
+    private func releaseRepair() {
+        repairLock.lock()
+        repairInProgress = false
+        repairLock.unlock()
     }
 
     private func makeConnection() -> NSXPCConnection {
